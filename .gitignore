@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Laravel
+backend/.env
+backend/storage/logs/
+backend/storage/app/
+backend/storage/framework/cache/
+backend/storage/framework/sessions/
+backend/storage/framework/views/
+backend/bootstrap/cache/
+backend/.phpunit.result.cache
+
+# Nuxt
+frontend/.nuxt/
+frontend/.output/
+frontend/dist/
+frontend/.env
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
