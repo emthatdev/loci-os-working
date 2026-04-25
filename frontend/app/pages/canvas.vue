@@ -1,50 +1,52 @@
 <template>
   <div class="canvas-page">
-    <TresCanvas window-size :alpha="true" :antialias="true" class="tres-canvas">
-      <TresPerspectiveCamera :position="[0, 0, 20]" :fov="60" />
-      <OrbitControls
-        :enable-damping="true"
-        :damping-factor="0.07"
-        :enable-pan="true"
-        :enable-zoom="true"
-        :min-distance="5"
-        :max-distance="80"
-      />
+    <ClientOnly>
+      <TresCanvas window-size clear-color="#05030f" :antialias="true">
+        <TresPerspectiveCamera :position="[0, 0, 22]" :fov="55" />
+        <OrbitControls
+          :enable-damping="true"
+          :damping-factor="0.06"
+          :enable-pan="true"
+          :enable-zoom="true"
+          :min-distance="3"
+          :max-distance="80"
+        />
 
-      <TresAmbientLight :intensity="0.6" />
-      <TresDirectionalLight :position="[10, 20, 10]" :intensity="1.2" />
+        <TresAmbientLight color="#ffffff" :intensity="2" />
+        <TresPointLight :position="[15, 15, 15]" color="#a78bfa" :intensity="120" />
+        <TresPointLight :position="[-15, -10, -10]" color="#6366f1" :intensity="60" />
 
-      <TresGroup v-for="card in memoryCards" :key="card.id" :position="card.position">
-        <!-- Card body -->
-        <TresMesh
-          @click="selectMemory(card)"
-          @pointerover="hoveredId = card.id"
-          @pointerout="hoveredId = null"
+        <TresGroup
+          v-for="card in memoryCards"
+          :key="card.id"
+          :position="card.position"
+          :rotation="card.rotation"
+          :scale="hoveredId === card.id ? [1.06, 1.06, 1] : [1, 1, 1]"
         >
-          <TresBoxGeometry :args="[3.2, 2, 0.08]" />
-          <TresMeshStandardMaterial
-            :color="card.color"
-            :emissive="card.color"
-            :emissive-intensity="hoveredId === card.id ? 0.6 : 0.25"
-            :metalness="0.1"
-            :roughness="0.6"
-            :transparent="true"
-            :opacity="0.92"
-          />
-        </TresMesh>
-        <!-- Glow halo -->
-        <TresMesh :position="[0, 0, -0.05]">
-          <TresBoxGeometry :args="[3.5, 2.3, 0.01]" />
-          <TresMeshStandardMaterial
-            :color="card.color"
-            :emissive="card.color"
-            :emissive-intensity="0.4"
-            :transparent="true"
-            :opacity="hoveredId === card.id ? 0.35 : 0.12"
-          />
-        </TresMesh>
-      </TresGroup>
-    </TresCanvas>
+          <TresMesh
+            @click="selectMemory(card)"
+            @pointerover="hoveredId = card.id"
+            @pointerout="hoveredId = null"
+          >
+            <TresPlaneGeometry :args="[3.2, 2]" />
+            <TresMeshBasicMaterial
+              :map="card.texture"
+              :transparent="true"
+              :opacity="hoveredId === card.id ? 1 : 0.88"
+            />
+          </TresMesh>
+          <!-- Glow border behind the card -->
+          <TresMesh :position="[0, 0, -0.01]">
+            <TresPlaneGeometry :args="[3.32, 2.08]" />
+            <TresMeshBasicMaterial
+              :color="card.color"
+              :transparent="true"
+              :opacity="hoveredId === card.id ? 0.45 : 0.15"
+            />
+          </TresMesh>
+        </TresGroup>
+      </TresCanvas>
+    </ClientOnly>
 
     <!-- Top bar -->
     <header class="topbar">
@@ -111,6 +113,7 @@
 
 <script setup lang="ts">
 import { OrbitControls } from '@tresjs/cientos'
+import { CanvasTexture } from 'three'
 
 definePageMeta({ middleware: 'auth' })
 
@@ -130,7 +133,9 @@ interface Memory {
 interface MemoryCard {
   id: number
   position: [number, number, number]
+  rotation: [number, number, number]
   color: string
+  texture: CanvasTexture
   memory: Memory
 }
 
@@ -140,7 +145,7 @@ const TYPE_COLORS: Record<string, string> = {
   pdf:   '#10b981',
 }
 
-const memories = ref<Memory[]>([])
+const memoryCards = ref<MemoryCard[]>([])
 const chatOpen = ref(false)
 const uploadOpen = ref(false)
 const hoveredId = ref<number | null>(null)
@@ -149,28 +154,136 @@ const searchQuery = ref('')
 const searchResults = ref<Memory[]>([])
 const searching = ref(false)
 
-function cardPosition(id: number, index: number): [number, number, number] {
-  const seed = id * 2654435761
-  const x = ((seed & 0xffff) / 0xffff - 0.5) * 40
-  const y = (((seed >> 8) & 0xffff) / 0xffff - 0.5) * 24
-  const z = (((seed >> 16) & 0xffff) / 0xffff - 0.5) * 30
-  return [x, y, z]
+// --- deterministic positions from ID ---
+function rand(seed: number, salt: number): number {
+  const x = Math.sin(seed * 127.1 + salt * 311.7) * 43758.5453
+  return x - Math.floor(x)
+}
+function cardPosition(id: number): [number, number, number] {
+  return [
+    (rand(id, 0) - 0.5) * 44,
+    (rand(id, 1) - 0.5) * 26,
+    (rand(id, 2) - 0.5) * 34,
+  ]
+}
+function cardRotation(id: number): [number, number, number] {
+  return [
+    (rand(id, 3) - 0.5) * 0.3,
+    (rand(id, 4) - 0.5) * 0.5,
+    (rand(id, 5) - 0.5) * 0.15,
+  ]
 }
 
-const memoryCards = computed<MemoryCard[]>(() =>
-  memories.value.map((m, i) => ({
-    id: m.id,
-    position: cardPosition(m.id, i),
-    color: TYPE_COLORS[m.type] ?? '#7c3aed',
-    memory: m,
-  }))
-)
+// --- canvas texture for each card ---
+function wrapText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+  maxLines: number,
+): void {
+  const words = text.split(' ')
+  let line = ''
+  let drawn = 0
+  for (let i = 0; i < words.length; i++) {
+    const test = line ? `${line} ${words[i]}` : words[i]
+    if (ctx.measureText(test).width > maxWidth && line) {
+      ctx.fillText(line, x, y)
+      y += lineHeight
+      drawn++
+      if (drawn >= maxLines - 1) {
+        const rest = words.slice(i).join(' ')
+        ctx.fillText(rest.length > 55 ? rest.slice(0, 55) + '…' : rest, x, y)
+        return
+      }
+      line = words[i]
+    } else {
+      line = test
+    }
+  }
+  if (line) ctx.fillText(line, x, y)
+}
 
-const { data } = await useAsyncData('memories', () =>
-  request<Memory[]>('/memories')
-)
+function makeTexture(memory: Memory): CanvasTexture {
+  const color = TYPE_COLORS[memory.type] ?? '#7c3aed'
+  const W = 512
+  const H = 320
+  const cvs = document.createElement('canvas')
+  cvs.width = W
+  cvs.height = H
+  const ctx = cvs.getContext('2d')!
 
-if (data.value?.success) memories.value = data.value.data ?? []
+  // Background
+  ctx.fillStyle = '#130e25'
+  ctx.beginPath()
+  ctx.roundRect(0, 0, W, H, 14)
+  ctx.fill()
+
+  // Top accent stripe
+  ctx.fillStyle = color
+  ctx.fillRect(0, 0, W, 6)
+
+  // Subtle border
+  ctx.strokeStyle = color + '60'
+  ctx.lineWidth = 1.5
+  ctx.beginPath()
+  ctx.roundRect(0.75, 0.75, W - 1.5, H - 1.5, 14)
+  ctx.stroke()
+
+  // Type badge
+  ctx.fillStyle = color + '28'
+  ctx.beginPath()
+  ctx.roundRect(18, 18, 72, 24, 5)
+  ctx.fill()
+  ctx.fillStyle = color
+  ctx.font = 'bold 12px system-ui, sans-serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(memory.type.toUpperCase(), 54, 30)
+
+  // Content text
+  ctx.fillStyle = '#d4c8f0'
+  ctx.font = '15px system-ui, sans-serif'
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'top'
+  const text = memory.content ?? memory.file_path ?? '(no content)'
+  wrapText(ctx, text, 18, 60, W - 36, 26, 8)
+
+  // Date (bottom-right)
+  const date = new Date(memory.created_at).toLocaleDateString(undefined, { dateStyle: 'short' })
+  ctx.fillStyle = color + 'aa'
+  ctx.font = '11px system-ui, sans-serif'
+  ctx.textAlign = 'right'
+  ctx.textBaseline = 'bottom'
+  ctx.fillText(date, W - 18, H - 14)
+
+  return new CanvasTexture(cvs)
+}
+
+function buildCard(memory: Memory): MemoryCard {
+  return {
+    id: memory.id,
+    position: cardPosition(memory.id),
+    rotation: cardRotation(memory.id),
+    color: TYPE_COLORS[memory.type] ?? '#7c3aed',
+    texture: makeTexture(memory),
+    memory,
+  }
+}
+
+// Fetch on mount (client only — $api plugin is client-only)
+onMounted(async () => {
+  const res = await request<Memory[]>('/memories')
+  if (res.success) {
+    memoryCards.value = (res.data ?? []).map(buildCard)
+  }
+})
+
+onUnmounted(() => {
+  memoryCards.value.forEach(c => c.texture.dispose())
+})
 
 function selectMemory(card: MemoryCard) {
   selected.value = card.memory
@@ -195,7 +308,7 @@ function focusResult(r: Memory) {
 }
 
 function onMemorySaved(memory: Memory) {
-  memories.value.unshift(memory)
+  memoryCards.value.unshift(buildCard(memory))
 }
 
 function truncate(s: string, n: number) {
@@ -218,10 +331,6 @@ async function logout() {
   position: fixed; inset: 0;
   background: var(--bg);
   overflow: hidden;
-}
-
-.tres-canvas {
-  position: absolute; inset: 0;
 }
 
 /* Top bar */
