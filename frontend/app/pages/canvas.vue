@@ -1,48 +1,45 @@
 <template>
-  <div class="canvas-page">
+  <div
+    class="canvas-page"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @pointerleave="onPointerUp"
+    @wheel.prevent="onWheel"
+  >
     <ClientOnly>
       <TresCanvas window-size clear-color="#05030f" :antialias="true">
-        <TresPerspectiveCamera :position="[0, 0, 22]" :fov="55" />
-        <OrbitControls
-          :enable-damping="true"
-          :damping-factor="0.06"
-          :enable-pan="true"
-          :enable-zoom="true"
-          :min-distance="3"
-          :max-distance="80"
-        />
+        <!--
+          Camera position is driven entirely by our rAF loop via cameraRef.
+          The initial :position prop seeds Three.js on first mount only.
+        -->
+        <TresPerspectiveCamera ref="cameraRef" :position="[0, 0, 22]" :fov="55" />
 
         <TresAmbientLight color="#ffffff" :intensity="2" />
-        <TresPointLight :position="[15, 15, 15]" color="#a78bfa" :intensity="120" />
-        <TresPointLight :position="[-15, -10, -10]" color="#6366f1" :intensity="60" />
+        <TresPointLight :position="[0, 0, 18]" color="#a78bfa" :intensity="120" />
+        <TresPointLight :position="[0, 20, 0]" color="#6366f1" :intensity="60" />
 
         <TresGroup
           v-for="card in memoryCards"
           :key="card.id"
+          :ref="(el) => setGroupRef(card.id, el)"
           :position="card.position"
           :rotation="card.rotation"
-          :scale="hoveredId === card.id ? [1.06, 1.06, 1] : [1, 1, 1]"
         >
+          <!-- Main card face -->
           <TresMesh
+            :ref="(el) => setMeshRef(card.id, el)"
             @click="selectMemory(card)"
             @pointerover="hoveredId = card.id"
-            @pointerout="hoveredId = null"
+            @pointerout="() => { if (hoveredId === card.id) hoveredId = null }"
           >
             <TresPlaneGeometry :args="[3.2, 2]" />
-            <TresMeshBasicMaterial
-              :map="card.texture"
-              :transparent="true"
-              :opacity="hoveredId === card.id ? 1 : 0.88"
-            />
+            <TresMeshBasicMaterial :map="card.texture" :transparent="true" :opacity="0.88" />
           </TresMesh>
-          <!-- Glow border behind the card -->
-          <TresMesh :position="[0, 0, -0.01]">
-            <TresPlaneGeometry :args="[3.32, 2.08]" />
-            <TresMeshBasicMaterial
-              :color="card.color"
-              :transparent="true"
-              :opacity="hoveredId === card.id ? 0.45 : 0.15"
-            />
+          <!-- Glow halo (opacity driven by rAF, seeded at 0.15) -->
+          <TresMesh :ref="(el) => setGlowRef(card.id, el)" :position="[0, 0, -0.012]">
+            <TresPlaneGeometry :args="[3.36, 2.12]" />
+            <TresMeshBasicMaterial :color="card.color" :transparent="true" :opacity="0.15" />
           </TresMesh>
         </TresGroup>
       </TresCanvas>
@@ -57,11 +54,7 @@
     <!-- Search bar -->
     <div class="search-wrap">
       <form class="search-bar" @submit.prevent="runSearch">
-        <input
-          v-model="searchQuery"
-          placeholder="Search your memories…"
-          :disabled="searching"
-        />
+        <input v-model="searchQuery" placeholder="Search your memories…" :disabled="searching" />
         <button type="submit" :disabled="searching || !searchQuery.trim()">
           {{ searching ? '…' : '↑' }}
         </button>
@@ -80,7 +73,7 @@
       </div>
     </div>
 
-    <!-- Bottom-right actions -->
+    <!-- FABs -->
     <div class="actions">
       <button class="fab" title="Ask Loci OS" @click="chatOpen = true">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -112,8 +105,13 @@
 </template>
 
 <script setup lang="ts">
-import { OrbitControls } from '@tresjs/cientos'
-import { CanvasTexture } from 'three'
+import {
+  CanvasTexture,
+  type Mesh,
+  type Group,
+  type PerspectiveCamera,
+  MeshBasicMaterial,
+} from 'three'
 
 definePageMeta({ middleware: 'auth' })
 
@@ -121,6 +119,9 @@ const { request } = useApi()
 const auth = useAuthStore()
 const router = useRouter()
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 interface Memory {
   id: number
   type: string
@@ -129,7 +130,6 @@ interface Memory {
   created_at: string
   similarity?: number
 }
-
 interface MemoryCard {
   id: number
   position: [number, number, number]
@@ -139,22 +139,65 @@ interface MemoryCard {
   memory: Memory
 }
 
-const TYPE_COLORS: Record<string, string> = {
-  text:  '#7c3aed',
-  image: '#0ea5e9',
-  pdf:   '#10b981',
+// ---------------------------------------------------------------------------
+// Three.js object refs — updated directly in rAF, bypassing Vue reactivity
+// ---------------------------------------------------------------------------
+const cameraRef = ref<PerspectiveCamera | null>(null)
+const meshMap  = new Map<number, Mesh>()
+const glowMap  = new Map<number, Mesh>()
+const groupMap = new Map<number, Group>()
+
+function setMeshRef (id: number, el: unknown) { el ? meshMap.set(id,  el as Mesh)  : meshMap.delete(id) }
+function setGlowRef (id: number, el: unknown) { el ? glowMap.set(id,  el as Mesh)  : glowMap.delete(id) }
+function setGroupRef(id: number, el: unknown) { el ? groupMap.set(id, el as Group) : groupMap.delete(id) }
+
+// ---------------------------------------------------------------------------
+// Camera state (plain objects — no Vue reactivity overhead per frame)
+// ---------------------------------------------------------------------------
+const cam = { x: 0, y: 0, z: 22 }      // actual camera world position
+const vel = { x: 0, y: 0 }             // current velocity
+const targetVel = { x: 0, y: 0 }       // desired velocity (decays each frame)
+
+// Article constants:
+const V_LERP  = 0.22   // how fast velocity tracks target
+const V_DECAY = 0.88   // per-frame multiplier that drains targetVel → inertia ease-out
+
+// Distance fade thresholds (world units from camera)
+const FADE_START = 18
+const FADE_END   = 36
+
+// ---------------------------------------------------------------------------
+// Vue reactive state
+// ---------------------------------------------------------------------------
+const memoryCards   = ref<MemoryCard[]>([])
+const hoveredId     = ref<number | null>(null)
+const selected      = ref<Memory | null>(null)
+const chatOpen      = ref(false)
+const uploadOpen    = ref(false)
+const searchQuery   = ref('')
+const searchResults = ref<Memory[]>([])
+const searching     = ref(false)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function lerp(a: number, b: number, t: number) { return a + (b - a) * t }
+
+/**
+ * Quadratic distance fade — article pattern:
+ *   gridFade: 1 inside radius, smooth falloff to 0 outside
+ *   final: gridFade² for a sharper inner region feel
+ */
+function distanceFade(dist: number): number {
+  if (dist <= FADE_START) return 1
+  if (dist >= FADE_END)   return 0
+  const t = (dist - FADE_START) / (FADE_END - FADE_START)
+  return (1 - t) * (1 - t) // quadratic ease-out
 }
 
-const memoryCards = ref<MemoryCard[]>([])
-const chatOpen = ref(false)
-const uploadOpen = ref(false)
-const hoveredId = ref<number | null>(null)
-const selected = ref<Memory | null>(null)
-const searchQuery = ref('')
-const searchResults = ref<Memory[]>([])
-const searching = ref(false)
-
-// --- deterministic positions from ID ---
+// ---------------------------------------------------------------------------
+// Deterministic card layout
+// ---------------------------------------------------------------------------
 function rand(seed: number, salt: number): number {
   const x = Math.sin(seed * 127.1 + salt * 311.7) * 43758.5453
   return x - Math.floor(x)
@@ -174,7 +217,15 @@ function cardRotation(id: number): [number, number, number] {
   ]
 }
 
-// --- canvas texture for each card ---
+// ---------------------------------------------------------------------------
+// Canvas texture — renders text onto a 512×320 offscreen canvas
+// ---------------------------------------------------------------------------
+const TYPE_COLORS: Record<string, string> = {
+  text:  '#7c3aed',
+  image: '#0ea5e9',
+  pdf:   '#10b981',
+}
+
 function wrapText(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -208,56 +259,37 @@ function wrapText(
 
 function makeTexture(memory: Memory): CanvasTexture {
   const color = TYPE_COLORS[memory.type] ?? '#7c3aed'
-  const W = 512
-  const H = 320
+  const W = 512, H = 320
   const cvs = document.createElement('canvas')
-  cvs.width = W
-  cvs.height = H
+  cvs.width = W; cvs.height = H
   const ctx = cvs.getContext('2d')!
 
-  // Background
   ctx.fillStyle = '#130e25'
-  ctx.beginPath()
-  ctx.roundRect(0, 0, W, H, 14)
-  ctx.fill()
+  ctx.beginPath(); ctx.roundRect(0, 0, W, H, 14); ctx.fill()
 
-  // Top accent stripe
   ctx.fillStyle = color
   ctx.fillRect(0, 0, W, 6)
 
-  // Subtle border
-  ctx.strokeStyle = color + '60'
+  ctx.strokeStyle = color + '55'
   ctx.lineWidth = 1.5
-  ctx.beginPath()
-  ctx.roundRect(0.75, 0.75, W - 1.5, H - 1.5, 14)
-  ctx.stroke()
+  ctx.beginPath(); ctx.roundRect(0.75, 0.75, W - 1.5, H - 1.5, 14); ctx.stroke()
 
-  // Type badge
   ctx.fillStyle = color + '28'
-  ctx.beginPath()
-  ctx.roundRect(18, 18, 72, 24, 5)
-  ctx.fill()
+  ctx.beginPath(); ctx.roundRect(18, 18, 72, 24, 5); ctx.fill()
   ctx.fillStyle = color
-  ctx.font = 'bold 12px system-ui, sans-serif'
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 12px system-ui,sans-serif'
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
   ctx.fillText(memory.type.toUpperCase(), 54, 30)
 
-  // Content text
   ctx.fillStyle = '#d4c8f0'
-  ctx.font = '15px system-ui, sans-serif'
-  ctx.textAlign = 'left'
-  ctx.textBaseline = 'top'
-  const text = memory.content ?? memory.file_path ?? '(no content)'
-  wrapText(ctx, text, 18, 60, W - 36, 26, 8)
+  ctx.font = '15px system-ui,sans-serif'
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+  wrapText(ctx, memory.content ?? memory.file_path ?? '(no content)', 18, 60, W - 36, 26, 8)
 
-  // Date (bottom-right)
-  const date = new Date(memory.created_at).toLocaleDateString(undefined, { dateStyle: 'short' })
   ctx.fillStyle = color + 'aa'
-  ctx.font = '11px system-ui, sans-serif'
-  ctx.textAlign = 'right'
-  ctx.textBaseline = 'bottom'
-  ctx.fillText(date, W - 18, H - 14)
+  ctx.font = '11px system-ui,sans-serif'
+  ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'
+  ctx.fillText(new Date(memory.created_at).toLocaleDateString(undefined, { dateStyle: 'short' }), W - 18, H - 14)
 
   return new CanvasTexture(cvs)
 }
@@ -273,30 +305,137 @@ function buildCard(memory: Memory): MemoryCard {
   }
 }
 
-// Fetch on mount (client only — $api plugin is client-only)
+// ---------------------------------------------------------------------------
+// rAF render loop — velocity integration + per-card fade/scale
+// ---------------------------------------------------------------------------
+let raf = 0
+
+function tick() {
+  // --- Inertia (article pattern: lerp velocity toward target, decay target) ---
+  vel.x = lerp(vel.x, targetVel.x, V_LERP)
+  vel.y = lerp(vel.y, targetVel.y, V_LERP)
+  targetVel.x *= V_DECAY
+  targetVel.y *= V_DECAY
+
+  if (Math.abs(vel.x) > 0.0001 || Math.abs(vel.y) > 0.0001) {
+    cam.x += vel.x
+    cam.y += vel.y
+  }
+
+  // Push to Three.js camera directly (no Vue reactive overhead per-frame)
+  const camera = cameraRef.value
+  if (camera?.position) {
+    camera.position.set(cam.x, cam.y, cam.z)
+  }
+
+  // --- Per-card: distance fade + hover scale (direct Three.js mutation) ---
+  const hov = hoveredId.value
+  for (const card of memoryCards.value) {
+    const mesh  = meshMap.get(card.id)
+    const glow  = glowMap.get(card.id)
+    const group = groupMap.get(card.id)
+    if (!mesh || !glow || !group) continue
+
+    // Distance from camera to card centre
+    const dx = card.position[0] - cam.x
+    const dy = card.position[1] - cam.y
+    const dz = card.position[2] - cam.z
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    const isHovered = hov === card.id
+    const fade = distanceFade(dist)
+    const targetOpacity = fade * (isHovered ? 1 : 0.88)
+
+    // Lerp opacity — article uses 0.18, we use 0.12 for a slightly slower drift
+    const mat = mesh.material as MeshBasicMaterial
+    mat.opacity = lerp(mat.opacity, targetOpacity, 0.12)
+    mesh.visible = mat.opacity > 0.005
+
+    // Glow tracks card opacity
+    const glowMat = glow.material as MeshBasicMaterial
+    glowMat.opacity = lerp(glowMat.opacity, fade * (isHovered ? 0.45 : 0.15), 0.15)
+    glow.visible = glowMat.opacity > 0.005
+
+    // Scale hover spring
+    const targetScale = isHovered ? 1.06 : 1
+    const s = lerp(group.scale.x, targetScale, 0.14)
+    group.scale.setScalar(s)
+  }
+
+  raf = requestAnimationFrame(tick)
+}
+
+// ---------------------------------------------------------------------------
+// Pointer + wheel navigation
+// ---------------------------------------------------------------------------
+let isDragging = false
+let lastPtr = { x: 0, y: 0 }
+
+function onPointerDown(e: PointerEvent) {
+  // Don't hijack clicks on HTML UI elements
+  if ((e.target as Element).closest('header, button, input, form, .detail-card, .panel')) return
+  isDragging = true
+  lastPtr = { x: e.clientX, y: e.clientY }
+  ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
+}
+
+function onPointerMove(e: PointerEvent) {
+  if (!isDragging) return
+  const dx = e.clientX - lastPtr.x
+  const dy = e.clientY - lastPtr.y
+  // Pan speed scales with zoom depth so movement feels consistent at any zoom
+  const scale = cam.z * 0.0014
+  targetVel.x -= dx * scale
+  targetVel.y += dy * scale
+  lastPtr = { x: e.clientX, y: e.clientY }
+}
+
+function onPointerUp(e: PointerEvent) {
+  if (isDragging) {
+    try { (e.currentTarget as Element).releasePointerCapture(e.pointerId) } catch { /* noop */ }
+  }
+  isDragging = false
+  // intentionally do NOT zero velocity — let inertia carry through
+}
+
+function onWheel(e: WheelEvent) {
+  if (e.ctrlKey) {
+    // Pinch zoom / Ctrl+scroll → move along Z
+    cam.z = Math.max(5, Math.min(80, cam.z + e.deltaY * 0.04))
+  } else {
+    // Trackpad two-finger pan or mouse wheel scroll → pan XY
+    const scale = cam.z * 0.001
+    targetVel.x += e.deltaX * scale
+    targetVel.y -= e.deltaY * scale
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
 onMounted(async () => {
   const res = await request<Memory[]>('/memories')
   if (res.success) {
     memoryCards.value = (res.data ?? []).map(buildCard)
   }
+  raf = requestAnimationFrame(tick)
 })
 
 onUnmounted(() => {
+  cancelAnimationFrame(raf)
   memoryCards.value.forEach(c => c.texture.dispose())
 })
 
-function selectMemory(card: MemoryCard) {
-  selected.value = card.memory
-}
+// ---------------------------------------------------------------------------
+// UI handlers
+// ---------------------------------------------------------------------------
+function selectMemory(card: MemoryCard) { selected.value = card.memory }
 
 async function runSearch() {
   const q = searchQuery.value.trim()
   if (!q) return
   searching.value = true
-  const res = await request<Memory[]>('/memories/search', {
-    method: 'POST',
-    body: { query: q },
-  })
+  const res = await request<Memory[]>('/memories/search', { method: 'POST', body: { query: q } })
   searching.value = false
   searchResults.value = res.success ? (res.data ?? []) : []
 }
@@ -311,13 +450,8 @@ function onMemorySaved(memory: Memory) {
   memoryCards.value.unshift(buildCard(memory))
 }
 
-function truncate(s: string, n: number) {
-  return s.length > n ? s.slice(0, n) + '…' : s
-}
-
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' })
-}
+function truncate(s: string, n: number) { return s.length > n ? s.slice(0, n) + '…' : s }
+function formatDate(iso: string) { return new Date(iso).toLocaleDateString(undefined, { dateStyle: 'medium' }) }
 
 async function logout() {
   await request('/logout', { method: 'POST' })
@@ -331,7 +465,12 @@ async function logout() {
   position: fixed; inset: 0;
   background: var(--bg);
   overflow: hidden;
+  /* Prevent browser text-selection drag and default touch panning */
+  user-select: none;
+  touch-action: none;
+  cursor: grab;
 }
+.canvas-page:active { cursor: grabbing; }
 
 /* Top bar */
 .topbar {
@@ -339,7 +478,8 @@ async function logout() {
   display: flex; align-items: center; justify-content: space-between;
   padding: 1rem 1.5rem;
   z-index: 10;
-  background: linear-gradient(to bottom, rgba(5,3,15,0.8) 0%, transparent 100%);
+  background: linear-gradient(to bottom, rgba(5,3,15,0.85) 0%, transparent 100%);
+  cursor: default;
 }
 .logo {
   font-size: 1.125rem; font-weight: 700; letter-spacing: -0.02em;
@@ -359,6 +499,7 @@ async function logout() {
   transform: translateX(-50%);
   width: min(480px, calc(100vw - 8rem));
   z-index: 10;
+  cursor: default;
 }
 .search-bar {
   display: flex; gap: 0.5rem;
@@ -371,7 +512,7 @@ async function logout() {
 }
 .search-bar input {
   flex: 1; background: none; border: none; color: var(--text);
-  font-size: 0.9375rem; outline: none;
+  font-size: 0.9375rem; outline: none; cursor: text;
 }
 .search-bar input::placeholder { color: var(--muted); opacity: 0.6; }
 .search-bar button {
@@ -404,14 +545,17 @@ async function logout() {
   font-size: 0.6875rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.05em; color: var(--accent); flex-shrink: 0;
 }
-.result-content { flex: 1; font-size: 0.875rem; color: var(--text); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.result-content {
+  flex: 1; font-size: 0.875rem; color: var(--text);
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
 .result-sim { font-size: 0.75rem; color: var(--muted); flex-shrink: 0; }
 
 /* FABs */
 .actions {
   position: fixed; bottom: 2rem; right: 1.5rem;
   display: flex; flex-direction: column; gap: 0.75rem;
-  z-index: 10;
+  z-index: 10; cursor: default;
 }
 .fab {
   width: 44px; height: 44px; border-radius: 50%;
@@ -426,11 +570,11 @@ async function logout() {
 .fab-primary { background: var(--accent); border-color: transparent; color: #fff; }
 .fab-primary:hover { background: #6d28d9; color: #fff; }
 
-/* Detail card */
+/* Detail */
 .detail-card {
   position: fixed; inset: 0;
   display: flex; align-items: center; justify-content: center;
-  z-index: 50; padding: 1rem;
+  z-index: 50; padding: 1rem; cursor: default;
 }
 .detail-inner {
   background: var(--surface);
