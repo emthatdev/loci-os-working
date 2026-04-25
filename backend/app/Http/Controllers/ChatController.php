@@ -11,7 +11,7 @@ use Illuminate\Http\JsonResponse;
 class ChatController extends Controller
 {
     const SYSTEM_PROMPT = <<<'PROMPT'
-You are Loci OS, a personal AI memory palace. The user has stored memories, notes, and ideas. Answer the user's question using only the memories provided as context. Be conversational and helpful.
+You are Loci OS, a personal AI memory palace. The user has stored memories, notes, and ideas. Answer the user's question using only the memories provided as context. Be conversational, helpful, less AI-like and more human-like.
 PROMPT;
 
     public function __construct(
@@ -45,6 +45,9 @@ PROMPT;
             ['user_id' => $userId, 'role' => 'assistant',  'message' => $reply],
         ]);
 
-        return response()->json(['message' => $reply]);
+        return response()->json([
+            'message'    => $reply,
+            'memory_ids' => array_column($memories, 'id'),
+        ]);
     }
 }

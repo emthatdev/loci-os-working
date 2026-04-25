@@ -99,7 +99,7 @@
       </div>
     </Transition>
 
-    <ChatPanel :open="chatOpen" @close="chatOpen = false" />
+    <ChatPanel :open="chatOpen" @close="chatOpen = false" @cited="triggerPulse" />
     <UploadModal :open="uploadOpen" @close="uploadOpen = false" @saved="onMemorySaved" />
 
     <!-- Loading overlay — blocks interaction until memories are fetched -->
@@ -169,6 +169,16 @@ let camTargetZ = 22                     // zoom target; lerped toward each frame
 const vel = { x: 0, y: 0 }             // current velocity
 const targetVel = { x: 0, y: 0 }       // desired velocity (decays each frame)
 
+// Fly-to state — set by selectMemory(), cleared once FLY_DURATION elapses
+let flyTarget: { x: number; y: number; z: number } | null = null
+let pendingSelect: Memory | null = null
+let flyStartTime = 0
+const FLY_DURATION = 900 // ms
+
+// Citation pulse state — written by triggerPulse, consumed in tick()
+const citedIds  = new Set<number>()
+const pulseStart = new Map<number, number>()
+
 // Article constants:
 const V_LERP  = 0.22   // how fast velocity tracks target
 const V_DECAY = 0.88   // per-frame multiplier that drains targetVel → inertia ease-out
@@ -214,18 +224,18 @@ function rand(seed: number, salt: number): number {
   const x = Math.sin(seed * 127.1 + salt * 311.7) * 43758.5453
   return x - Math.floor(x)
 }
-function cardPosition(id: number): [number, number, number] {
+function cardPosition(id: number, zBias = 0): [number, number, number] {
   return [
     (rand(id, 0) - 0.5) * 44,
     (rand(id, 1) - 0.5) * 26,
-    (rand(id, 2) - 0.5) * 34,
+    zBias + (rand(id, 2) - 0.5) * 8,
   ]
 }
 function cardRotation(id: number): [number, number, number] {
   return [
-    (rand(id, 3) - 0.5) * 0.3,
-    (rand(id, 4) - 0.5) * 0.5,
-    (rand(id, 5) - 0.5) * 0.15,
+    (rand(id, 3) - 0.5) * 0.08,
+    (rand(id, 4) - 0.5) * 0.12,
+    (rand(id, 5) - 0.5) * 0.05,
   ]
 }
 
@@ -306,10 +316,10 @@ function makeTexture(memory: Memory): CanvasTexture {
   return new CanvasTexture(cvs)
 }
 
-function buildCard(memory: Memory): MemoryCard {
+function buildCard(memory: Memory, zBias = 0): MemoryCard {
   return {
     id: memory.id,
-    position: cardPosition(memory.id),
+    position: cardPosition(memory.id, zBias),
     rotation: cardRotation(memory.id),
     color: TYPE_COLORS[memory.type] ?? '#7c3aed',
     texture: makeTexture(memory),
@@ -323,15 +333,29 @@ function buildCard(memory: Memory): MemoryCard {
 let raf = 0
 
 function tick() {
-  // --- Inertia (article pattern: lerp velocity toward target, decay target) ---
-  vel.x = lerp(vel.x, targetVel.x, V_LERP)
-  vel.y = lerp(vel.y, targetVel.y, V_LERP)
-  targetVel.x *= V_DECAY
-  targetVel.y *= V_DECAY
+  const now = performance.now()
 
-  if (Math.abs(vel.x) > 0.0001 || Math.abs(vel.y) > 0.0001) {
-    cam.x += vel.x
-    cam.y += vel.y
+  if (flyTarget) {
+    // Fly-to: lerp camera XY toward the card, Z handled by camTargetZ below
+    cam.x = lerp(cam.x, flyTarget.x, 0.055)
+    cam.y = lerp(cam.y, flyTarget.y, 0.055)
+    camTargetZ = flyTarget.z
+    if (now - flyStartTime >= FLY_DURATION) {
+      selected.value = pendingSelect
+      pendingSelect = null
+      flyTarget = null
+    }
+  } else {
+    // --- Inertia (article pattern: lerp velocity toward target, decay target) ---
+    vel.x = lerp(vel.x, targetVel.x, V_LERP)
+    vel.y = lerp(vel.y, targetVel.y, V_LERP)
+    targetVel.x *= V_DECAY
+    targetVel.y *= V_DECAY
+
+    if (Math.abs(vel.x) > 0.0001 || Math.abs(vel.y) > 0.0001) {
+      cam.x += vel.x
+      cam.y += vel.y
+    }
   }
 
   // Smooth zoom — same lerp handles both the intro animation and wheel zoom
@@ -366,9 +390,16 @@ function tick() {
     mat.opacity = lerp(mat.opacity, targetOpacity, 0.12)
     mesh.visible = mat.opacity > 0.005
 
-    // Glow tracks card opacity
+    // Glow tracks card opacity, boosted by citation pulse
     const glowMat = glow.material as MeshBasicMaterial
-    glowMat.opacity = lerp(glowMat.opacity, fade * (isHovered ? 0.45 : 0.15), 0.15)
+    let pulseBoost = 0
+    if (citedIds.has(card.id)) {
+      const elapsed = now - (pulseStart.get(card.id) ?? now)
+      const t = Math.min(1, elapsed / 2000)
+      if (t >= 1) { citedIds.delete(card.id); pulseStart.delete(card.id) }
+      else pulseBoost = Math.sin(t * Math.PI * 5) * (1 - t) * 0.5
+    }
+    glowMat.opacity = lerp(glowMat.opacity, fade * (isHovered ? 0.45 : 0.15) + pulseBoost, 0.15)
     glow.visible = glowMat.opacity > 0.005
 
     // Scale hover spring
@@ -394,6 +425,8 @@ let startPtr    = { x: 0, y: 0 }
 
 function onPointerDown(e: PointerEvent) {
   if ((e.target as Element).closest('header, button, input, form, .detail-card, .panel')) return
+  // Cancel any in-progress fly so the user can take manual control immediately
+  if (flyTarget) { flyTarget = null; pendingSelect = null }
   isDragging = false
   captured   = false
   lastPtr    = { x: e.clientX, y: e.clientY }
@@ -445,36 +478,73 @@ function onWheel(e: WheelEvent) {
   }
 }
 
+function onKeyDown(e: KeyboardEvent) {
+  // Don't intercept when typing in an input or textarea
+  if ((e.target as Element).closest('input, textarea')) return
+  if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return
+  e.preventDefault()
+
+  const PAN_STEP  = 0.06
+  const ZOOM_STEP = 1.5
+
+  switch (e.key) {
+    case 'ArrowUp':    camTargetZ = Math.max(5,  camTargetZ - ZOOM_STEP); break
+    case 'ArrowDown':  camTargetZ = Math.min(80, camTargetZ + ZOOM_STEP); break
+    case 'ArrowLeft':  targetVel.x -= PAN_STEP; break
+    case 'ArrowRight': targetVel.x += PAN_STEP; break
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Data loading
 // ---------------------------------------------------------------------------
 onMounted(async () => {
   const res = await request<Memory[]>('/memories')
   if (res.success) {
-    const cards = (res.data ?? []).map(buildCard)
+    // Most recent first (index 0) → zBias +8 (close); oldest → zBias -8 (far/faded)
+    const arr = res.data ?? []
+    const cards = arr.map((m, i) =>
+      buildCard(m, lerp(8, -8, i / Math.max(1, arr.length - 1))),
+    )
     memoryCards.value = cards
 
     if (cards.length > 0) {
-      cam.x = cards.reduce((s, c) => s + c.position[0], 0) / cards.length
-      cam.y = cards.reduce((s, c) => s + c.position[1], 0) / cards.length
+      // Aim the intro zoom directly at the most recent card (backend returns newest-first)
+      const latest = cards[0]
+      cam.x = latest.position[0]
+      cam.y = latest.position[1]
+      camTargetZ = latest.position[2] + 8
     }
   }
-  // Start the camera far out; camTargetZ stays at 22 so tick lerps it in
+  // Start far back on the same XY axis — tick lerps cam.z toward camTargetZ
   cam.z = 80
-  camTargetZ = 22
   loading.value = false
   raf = requestAnimationFrame(tick)
+  window.addEventListener('keydown', onKeyDown)
 })
 
 onUnmounted(() => {
   cancelAnimationFrame(raf)
+  window.removeEventListener('keydown', onKeyDown)
   memoryCards.value.forEach(c => c.texture.dispose())
 })
 
 // ---------------------------------------------------------------------------
 // UI handlers
 // ---------------------------------------------------------------------------
-function selectMemory(card: MemoryCard) { selected.value = card.memory }
+function selectMemory(card: MemoryCard) {
+  // Zero out pan inertia so the fly feels clean
+  vel.x = 0; vel.y = 0; targetVel.x = 0; targetVel.y = 0
+  flyTarget = { x: card.position[0], y: card.position[1], z: card.position[2] + 7 }
+  camTargetZ = flyTarget.z
+  pendingSelect = card.memory
+  flyStartTime  = performance.now()
+}
+
+function triggerPulse(ids: number[]) {
+  const now = performance.now()
+  for (const id of ids) { citedIds.add(id); pulseStart.set(id, now) }
+}
 
 async function runSearch() {
   const q = searchQuery.value.trim()
@@ -492,7 +562,8 @@ function focusResult(r: Memory) {
 }
 
 function onMemorySaved(memory: Memory) {
-  memoryCards.value.unshift(buildCard(memory))
+  // Newly saved memory is the most recent — place it at the front layer
+  memoryCards.value.unshift(buildCard(memory, 8))
 }
 
 function truncate(s: string, n: number) { return s.length > n ? s.slice(0, n) + '…' : s }

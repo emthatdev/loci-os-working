@@ -39,7 +39,10 @@
 
 <script setup lang="ts">
 defineProps<{ open: boolean }>()
-defineEmits(['close'])
+const emit = defineEmits<{
+  close: []
+  cited: [ids: number[]]
+}>()
 
 const { request } = useApi()
 
@@ -59,7 +62,7 @@ async function send() {
   loading.value = true
   await nextTick(() => scrollBottom())
 
-  const res = await request<{ message: string }>('/chat', {
+  const res = await request<{ message: string; memory_ids: number[] }>('/chat', {
     method: 'POST',
     body: { message: text },
   })
@@ -67,6 +70,9 @@ async function send() {
     role: 'assistant',
     content: res.success && res.data ? res.data.message : 'Sorry, something went wrong.',
   })
+  if (res.success && res.data?.memory_ids?.length) {
+    emit('cited', res.data.memory_ids)
+  }
   loading.value = false
   await nextTick(() => scrollBottom())
 }
